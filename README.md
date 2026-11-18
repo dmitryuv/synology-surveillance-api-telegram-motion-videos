@@ -49,6 +49,10 @@ For example:
 * `tele_bot_token`: Telegram Bot token, this is a default global setting, can be skipped when using per-camera setting
 * `tele_chat_id`: Target chat id, this is a default global setting, can be skipped when using per-camera setting
 * `video_preset`: Global x264 encoding preset for mp4 delivery (default "veryfast")
+* `tele_read_timeout`: Read timeout in seconds for Telegram HTTP requests (default 60)
+* `tele_connect_timeout`: Connect timeout in seconds for Telegram HTTP requests (default 20)
+* `tele_send_attempts`: Upload attempts per event, hard-limited to 3 (default 3); after the last failed attempt the event is marked as processed
+* `tele_retry_backoff_secs`: Base backoff between upload attempts in seconds (default 5, grows as 5/10/...)
 * `ffmpeg_working_folder`: Working folder for downloaded mp4 videos and created GIFs
 * `synology_base_api_url`: Base url of Synology Surveillance Station APIs
 * `synology_user`: User to access Synology Surveillance Station APIs

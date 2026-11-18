@@ -10,7 +10,7 @@ import time
 import telebot
 from sqlite3 import Error
 from telebot import apihelper
-from telebot.apihelper import ApiTelegramException
+from telebot.apihelper import ApiException, ApiTelegramException
 
 import requests
 # disable SSL exceptions
@@ -51,6 +51,41 @@ DEFAULT_VIDEO_MAX_HEIGHT = 480
 DEFAULT_VIDEO_PRESET = "veryfast"
 X264_PRESETS = {"ultrafast", "superfast", "veryfast", "faster", "fast",
                 "medium", "slow", "slower", "veryslow", "placebo"}
+
+# Telegram HTTP timeouts (telebot defaults are 15s connect / 30s read), increased
+# for a slow proxy
+DEFAULT_TELE_CONNECT_TIMEOUT = 20
+DEFAULT_TELE_READ_TIMEOUT = 60
+# a single upload attempt is retried at most this many times per event
+DEFAULT_TELE_SEND_ATTEMPTS = 3
+MAX_TELE_SEND_ATTEMPTS = 3
+DEFAULT_TELE_RETRY_BACKOFF_SECS = 5
+# cap Telegram "retry_after" so a rate limit cannot block the polling loop for minutes
+TELEGRAM_RETRY_AFTER_CAP_SECS = 60
+# the "uploading video" chat action is best effort and gets its own short timeout
+TELEGRAM_CHAT_ACTION_TIMEOUT_SECS = 10
+
+
+def config_positive_number(config, key, default):
+    raw = config.get(key, default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logging.warning('Invalid %s %r, using default %s', key, raw, default)
+        return default
+    if value <= 0:
+        logging.warning('Invalid %s %r, using default %s', key, raw, default)
+        return default
+    return value
+
+
+def telegram_send_attempts(config):
+    attempts = int(config_positive_number(config, "tele_send_attempts", DEFAULT_TELE_SEND_ATTEMPTS))
+    if attempts > MAX_TELE_SEND_ATTEMPTS:
+        logging.warning('tele_send_attempts %i exceeds the hard limit, using %i',
+                        attempts, MAX_TELE_SEND_ATTEMPTS)
+        attempts = MAX_TELE_SEND_ATTEMPTS
+    return max(1, attempts)
 
 
 def normalize_video_height(video_max_height):
@@ -306,125 +341,229 @@ class CameraMotionEventHandler:
         self.sid = sid
         self.processed_events_conn = processed_events_conn
 
-    def publish_telegram_message(self, gif):
-        max_attempts = 3  # maximum number of retries
+    @staticmethod
+    def _reset_telegram_session():
+        # Drop the keep-alive connection pool so a retry opens a fresh SOCKS/TCP
+        # connection instead of reusing a socket left dead by a stalled tunnel.
+        try:
+            apihelper._get_req_session(reset=True)
+        except Exception as e:  # private telebot API, never break sending because of it
+            logging.debug('Cannot reset Telegram HTTP session: %s', e)
+
+    @staticmethod
+    def _remove_file(path):
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            logging.warning('Cannot remove file %s: %s', path, e)
+
+    def _mark_event_processed(self, camera_id, event_id):
+        processed_event = (camera_id, event_id, datetime.datetime.now())
+        replace_processed_events(self.processed_events_conn, processed_event)
+
+    def _send_chat_action(self, chat_id):
+        # Best effort only: a dead tunnel must not consume a send attempt.
+        try:
+            self.camera["bot"].send_chat_action(chat_id, 'upload_video',
+                                                timeout=TELEGRAM_CHAT_ACTION_TIMEOUT_SECS)
+        except Exception as e:
+            logging.warning('Cannot send chat action for camera_id %i: %s: %s',
+                            self.camera["id"], type(e).__name__, e)
+
+    def _send_media(self, path, sender, kind):
+        """Upload an already prepared file, retrying transient Telegram/proxy errors.
+
+        Download and conversion happen once per event; only the upload is retried.
+        Returns True when the file was delivered.
+        """
+        camera_id = self.camera["id"]
+        chat_id = self.camera["tele_chat_id"]
+        max_attempts = telegram_send_attempts(self.config)
+        backoff_secs = config_positive_number(self.config, "tele_retry_backoff_secs",
+                                              DEFAULT_TELE_RETRY_BACKOFF_SECS)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = -1
+        logging.info('Sending %s %s (%i bytes) to Telegram for camera_id %i, up to %i attempts',
+                     kind, path, size, camera_id, max_attempts)
+
         for attempt in range(1, max_attempts + 1):
+            started = time.monotonic()
+            retry_after_secs = None
+
+            if attempt == 1:
+                self._send_chat_action(chat_id)
+
             try:
-                if not "bot" in self.camera:
-                    logging.error("Camera %s does not have bot configured", self.camera["id"])
-                    return True
-
-                tb = self.camera["bot"]
-                chat_id = self.camera["tele_chat_id"]
-                tb.send_chat_action(chat_id, 'upload_video')
-
-                with open(gif, "rb") as fb:
-                    tb.send_animation(chat_id, fb, disable_notification=True, caption=self.camera["name"])
-
-                # remove file on success
-                os.remove(gif)
+                with open(path, "rb") as fb:
+                    sender(fb)
+                logging.info('Telegram %s sent for camera_id %i (attempt %i/%i, %.1fs)',
+                             kind, camera_id, attempt, max_attempts, time.monotonic() - started)
                 return True
 
             except ApiTelegramException as e:
-                if e.error_code == 429:  # "Too Many Requests"
-                    retry_after = e.result_json['parameters']['retry_after']
-                    logging.warning("Telegram rate limit hit (attempt %d/%d). Retrying in %s seconds...", 
-                                   attempt, max_attempts, retry_after)
-                    time.sleep(retry_after)
+                elapsed = time.monotonic() - started
+                error_code = e.error_code or 0
+                if error_code == 429:  # "Too Many Requests"
+                    parameters = (e.result_json or {}).get("parameters") or {}
+                    try:
+                        retry_after_secs = float(parameters.get("retry_after",
+                                                                DEFAULT_TELE_RETRY_BACKOFF_SECS))
+                    except (TypeError, ValueError):
+                        retry_after_secs = DEFAULT_TELE_RETRY_BACKOFF_SECS
+                    retry_after_secs = min(retry_after_secs, TELEGRAM_RETRY_AFTER_CAP_SECS)
+                    logging.warning('Telegram rate limit hit for camera_id %i (attempt %i/%i, %.1fs), '
+                                    'retry_after %ss',
+                                    camera_id, attempt, max_attempts, elapsed, retry_after_secs)
+                elif error_code >= 500:
+                    logging.warning('Telegram API transient error %i for camera_id %i (attempt %i/%i, %.1fs): %s',
+                                    error_code, camera_id, attempt, max_attempts, elapsed,
+                                    (e.result_json or {}).get('description', e))
                 else:
-                    logging.error("Telegram API exception: %s", e)
+                    logging.error('Telegram API rejected %s for camera_id %i (HTTP %i, attempt %i/%i, %.1fs): %s; '
+                                  'not retrying',
+                                  kind, camera_id, error_code, attempt, max_attempts, elapsed,
+                                  (e.result_json or {}).get('description', e))
                     return False
 
-            except Exception as e:
-                logging.error("General exception: %s", e)
+            except requests.exceptions.RequestException as e:
+                logging.warning('Telegram %s send attempt %i/%i for camera_id %i failed after %.1fs: %s: %s',
+                                kind, attempt, max_attempts, camera_id, time.monotonic() - started,
+                                type(e).__name__, e)
+
+            except ApiException as e:
+                status = getattr(e.result, "status_code", None)
+                if status is None or status == 200 or status >= 500:
+                    logging.warning('Telegram %s send attempt %i/%i for camera_id %i failed after %.1fs: %s '
+                                    '(HTTP %s, transient)',
+                                    kind, attempt, max_attempts, camera_id, time.monotonic() - started,
+                                    type(e).__name__, status)
+                else:
+                    logging.error('Telegram API error for camera_id %i (HTTP %s, attempt %i/%i, %.1fs): %s; '
+                                  'not retrying',
+                                  camera_id, status, attempt, max_attempts,
+                                  time.monotonic() - started, e)
+                    return False
+
+            except Exception:
+                logging.exception('Unexpected error while sending %s to Telegram for camera_id %i '
+                                  '(attempt %i/%i); not retrying',
+                                  kind, camera_id, attempt, max_attempts)
                 return False
 
-        logging.error("Failed to send after %d attempts", max_attempts)
+            if attempt >= max_attempts:
+                break
+            if retry_after_secs is not None:
+                delay = retry_after_secs
+            else:
+                self._reset_telegram_session()
+                delay = backoff_secs * attempt
+            logging.info('Retrying Telegram %s send for camera_id %i in %.1fs (attempt %i/%i)',
+                         kind, camera_id, delay, attempt + 1, max_attempts)
+            time.sleep(delay)
+
+        logging.error('Giving up sending %s for camera_id %i after %i attempts',
+                      kind, camera_id, max_attempts)
         return False
 
+    def publish_telegram_message(self, gif):
+        if not "bot" in self.camera:
+            logging.error("Camera %s does not have bot configured", self.camera["id"])
+            return True
+
+        tb = self.camera["bot"]
+        chat_id = self.camera["tele_chat_id"]
+        return self._send_media(
+            gif,
+            lambda fb: tb.send_animation(chat_id, fb, disable_notification=True,
+                                         caption=self.camera["name"]),
+            'gif')
 
     def publish_video_telegram_message(self, video, caption):
-        max_attempts = 3  # maximum number of retries
-        for attempt in range(1, max_attempts + 1):
-            try:
-                if not "bot" in self.camera:
-                    logging.error("Camera %s does not have bot configured", self.camera["id"])
-                    return True
+        if not "bot" in self.camera:
+            logging.error("Camera %s does not have bot configured", self.camera["id"])
+            return True
 
-                tb = self.camera["bot"]
-                chat_id = self.camera["tele_chat_id"]
-                tb.send_chat_action(chat_id, 'upload_video')
-
-                with open(video, "rb") as fb:
-                    tb.send_video(chat_id, fb, disable_notification=True, caption=caption)
-
-                # remove file on success
-                os.remove(video)
-                return True
-
-            except ApiTelegramException as e:
-                if e.error_code == 429:  # "Too Many Requests"
-                    retry_after = e.result_json['parameters']['retry_after']
-                    logging.warning("Telegram rate limit hit (attempt %d/%d). Retrying in %s seconds...",
-                                   attempt, max_attempts, retry_after)
-                    time.sleep(retry_after)
-                else:
-                    logging.error("Telegram API exception: %s", e)
-                    return False
-
-            except Exception as e:
-                logging.error("General exception: %s", e)
-                return False
-
-        logging.error("Failed to send after %d attempts", max_attempts)
-        return False
-
+        tb = self.camera["bot"]
+        chat_id = self.camera["tele_chat_id"]
+        return self._send_media(
+            video,
+            lambda fb: tb.send_video(chat_id, fb, disable_notification=True, caption=caption),
+            'mp4')
 
     def poll_event(self):
         camera_time = self.camera["skip_first_n_secs"] + self.camera["max_length_secs"]
         camera_id = self.camera["id"]
         event_id, event_ds_id = syno_last_event(self.base_url, camera_id, camera_time, self.camera["srcType"], self.camera["dsId"], self.sid)
-        if event_id > -1:
-            if is_event_processed(self.processed_events_conn, camera_id, event_id):
-                return None, None
+        if event_id <= -1:
+            return
+        if is_event_processed(self.processed_events_conn, camera_id, event_id):
+            return
 
-            logging.info('Start downloading event video for event_id %i, camera_id %i', event_id, camera_id)
-            play_time_ms = (camera_time + DOWNLOAD_MARGIN_SECS) * 1000
-            mp4_file = syno_download_video_partial(self.config["ffmpeg_working_folder"], self.base_url, event_id, event_ds_id, self.sid, play_time_ms)
+        logging.info('Start downloading event video for event_id %i, camera_id %i', event_id, camera_id)
+        play_time_ms = (camera_time + DOWNLOAD_MARGIN_SECS) * 1000
 
-            outdir = self.config["ffmpeg_working_folder"]
-            delivery = self.config.get("format", "mp4").lower()
+        outdir = self.config["ffmpeg_working_folder"]
+        delivery = self.config.get("format", "mp4").lower()
+        mp4_file = '{}/{}.mp4'.format(outdir, event_id)
+        if delivery == "gif":
+            outfile = '{}/{}.gif'.format(outdir, event_id)
+        else:
+            outfile = '{}/{}_video.mp4'.format(outdir, event_id)
+
+        try:
+            syno_download_video_partial(outdir, self.base_url, event_id, event_ds_id, self.sid, play_time_ms)
+
             fps = self.camera.get("fps", 15)
             video_max_height = self.camera.get("video_max_height", DEFAULT_VIDEO_MAX_HEIGHT)
             preset = self.config.get("video_preset", DEFAULT_VIDEO_PRESET)
 
             if delivery == "gif":
-                outfile = '{}/{}.gif'.format(outdir, event_id)
                 convert_retcode = convert_video_gif(video_max_height,
                                                     self.camera["skip_first_n_secs"],
                                                     self.camera["max_length_secs"],
                                                     mp4_file, outfile, fps=fps)
             else:
-                outfile = '{}/{}_video.mp4'.format(outdir, event_id)
                 convert_retcode = convert_video_to_mp4(video_max_height,
                                                        self.camera["skip_first_n_secs"],
                                                        self.camera["max_length_secs"],
                                                        mp4_file, outfile, fps=fps, preset=preset)
-            if os.path.exists(mp4_file):
-                os.remove(mp4_file)
-            if convert_retcode == 0:
-                if delivery == "gif":
-                    tele_retcode = self.publish_telegram_message(outfile)
-                else:
-                    tele_retcode = self.publish_video_telegram_message(outfile, self.camera["name"])
-                if tele_retcode:
-                    processed_event = (camera_id, event_id, datetime.datetime.now());
-                    replace_processed_events(self.processed_events_conn, processed_event)
-                    logging.info('Done processing event_id  %i, camera_id %i', event_id, camera_id)
-                else:
-                    logging.error('Invalid return code from telegram send for event_id %i, camera_id %i', event_id, camera_id)
-            else:
-                logging.error('Invalid return code from ffmpeg subprocess call for event id %i', event_id)
+        except Exception:
+            logging.exception('Failed to download/convert event_id %i, camera_id %i; marking as processed',
+                              event_id, camera_id)
+            self._remove_file(outfile)
+            self._mark_event_processed(camera_id, event_id)
+            return
+        finally:
+            self._remove_file(mp4_file)
+
+        if convert_retcode != 0:
+            logging.error('Invalid return code from ffmpeg subprocess call for event id %i; marking as processed',
+                          event_id)
+            self._remove_file(outfile)
+            self._mark_event_processed(camera_id, event_id)
+            return
+
+        if delivery == "gif":
+            tele_retcode = self.publish_telegram_message(outfile)
+        else:
+            tele_retcode = self.publish_video_telegram_message(outfile, self.camera["name"])
+
+        # The event is closed in both cases: the file is removed after delivery, and
+        # after the bounded send retries a failed event is dropped too, so the same
+        # event is never downloaded, converted and uploaded again on the next poll.
+        self._remove_file(outfile)
+        self._mark_event_processed(camera_id, event_id)
+        if tele_retcode:
+            logging.info('Done processing event_id %i, camera_id %i', event_id, camera_id)
+        else:
+            logging.error('Telegram send failed for event_id %i, camera_id %i after bounded retries; '
+                          'event marked as processed and %s removed',
+                          event_id, camera_id, outfile)
 
 
 def _configure_camera(config, camera_info):
@@ -469,6 +608,14 @@ def main():
         apihelper.API_URL = config["tele_base_url"] + "/bot{0}/{1}"
         logging.info("Telegram base URL set: %s", config["tele_base_url"])
 
+    apihelper.CONNECT_TIMEOUT = config_positive_number(config, "tele_connect_timeout",
+                                                       DEFAULT_TELE_CONNECT_TIMEOUT)
+    apihelper.READ_TIMEOUT = config_positive_number(config, "tele_read_timeout",
+                                                    DEFAULT_TELE_READ_TIMEOUT)
+    logging.info("Telegram timeouts: connect %ss, read %ss, send attempts %i",
+                 apihelper.CONNECT_TIMEOUT, apihelper.READ_TIMEOUT,
+                 telegram_send_attempts(config))
+
     config_data_folder = ''
     if 'data_folder' in config:
         config_data_folder = config["data_folder"]
@@ -508,7 +655,10 @@ def main():
                     camera["handler"] = CameraMotionEventHandler(processed_events_conn, config["synology_base_api_url"],
                                                                  camera,
                                                                  config, sid)
-                camera["handler"].poll_event()
+                try:
+                    camera["handler"].poll_event()
+                except Exception:
+                    logging.exception('Unhandled error while polling camera %s; continuing', camera["id"])
 
     except KeyboardInterrupt:
         logging.info('KeyboardInterrupt')
