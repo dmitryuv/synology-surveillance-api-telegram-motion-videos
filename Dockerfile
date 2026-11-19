@@ -12,7 +12,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
  && rm /tmp/requirements.txt
 
-COPY syno_telegram_gifs /syno_telegram_gifs
+COPY syno_telegram_videos /syno_telegram_videos
 
 # relative data_folder/ffmpeg_working_folder from the config ("/data", "/gifs")
 # resolve inside the mounted volumes from here.
@@ -20,5 +20,5 @@ WORKDIR /
 
 VOLUME ["/config", "/gifs", "/data"]
 
-ENTRYPOINT ["python3", "-m", "syno_telegram_gifs"]
+ENTRYPOINT ["python3", "-m", "syno_telegram_videos"]
 CMD ["/config/config.json"]

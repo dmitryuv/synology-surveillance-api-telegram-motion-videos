@@ -20,7 +20,7 @@ LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        prog="syno_telegram_gifs",
+        prog="syno_telegram_videos",
         description="Send Surveillance Station motion events to Telegram.",
     )
     parser.add_argument("config", help="path to config.json")

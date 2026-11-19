@@ -1,4 +1,4 @@
-# synology-surveillance-api-motion-telegram-gifs
+# synology-surveillance-api-telegram-motion-videos
 
 Sends the video of Synology Surveillance Station motion events to Telegram: the
 script polls recordings, cuts a short clip, re-encodes it and uploads it as an
@@ -32,13 +32,13 @@ docker run --rm \
   -v "$PWD/config.json:/config/config.json:ro" \
   -v "$PWD/data:/data" \
   -v "$PWD/gifs:/gifs" \
-  syno/syno_telegram_gifs:local /config/config.json
+  syno/syno_telegram_videos:local /config/config.json
 ```
 
 Or without Docker:
 
 ```bash
-python3 -m syno_telegram_gifs config.json
+python3 -m syno_telegram_videos config.json
 ```
 
 Flags for checks:
@@ -142,5 +142,5 @@ single-file version.
 
 ## Development
 
-* `./build.sh` builds `syno/syno_telegram_gifs:local`.
+* `./build.sh` builds `syno/syno_telegram_videos:local`.
 
