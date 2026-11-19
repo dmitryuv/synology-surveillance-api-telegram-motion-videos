@@ -1,0 +1,12 @@
+.git/
+work/
+**/__pycache__/
+**/*.pyc
+data/
+gifs/
+config.json
+config-test.json
+*.tar
+.DS_Store
+.idea/
+.venv/

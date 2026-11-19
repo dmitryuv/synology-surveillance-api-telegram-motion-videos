@@ -3,7 +3,7 @@
   "ffmpeg_working_folder": "./gifs",
   "tele_bot_token": "XXX",
   "tele_chat_id": 123,
-  "proxy": "socks5h://user:pas@ip",
+  "proxy": "socks5h://user:pass@ip",
   "tele_base_url": "https://your-custom-telegram-api-endpoint.com",
   "format": "mp4",
   "video_preset": "veryfast",
@@ -11,7 +11,13 @@
   "tele_connect_timeout": 20,
   "tele_send_attempts": 3,
   "tele_retry_backoff_secs": 5,
-  "synology_base_api_url": "http://127.0.0.1",
+  "poll_interval_secs": 10,
+  "event_backlog_secs": 0,
+  "syno_timeout_connect": 10,
+  "syno_timeout_read": 60,
+  "syno_verify_ssl": false,
+  "log_level": "INFO",
+  "synology_base_api_url": "https://127.0.0.1:5001",
   "synology_user": "admin",
   "synology_password": "password123",
   "synology_cameras": [
@@ -30,8 +36,7 @@
       "max_length_secs": 10,
       "video_max_height": 480,
       "fps": 12,
-      "tele_bot_token": "XXX",
-      "tele_chat_id": 123
+      "tele_chat_id": 456
     }
   ]
 }

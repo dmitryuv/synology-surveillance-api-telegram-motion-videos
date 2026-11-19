@@ -1,88 +1,146 @@
 # synology-surveillance-api-motion-telegram-gifs
-A python script to create animated gifs from videos recorded by cameras attached to Synology Surveillance Station and send them via telegram bot API
 
-Forked from [original project](https://github.com/dmitryuv/synology-surveillance-api-motion-telegram-gifs) with few key changes and small fixes:
-1. Updated API version, tested only on DSM 7+ with Surveillance Station 9+.
-2. Added support for per-camera telegram targets, including different bot tokens per my needs.
-3. Added support for CMS configuration, where cameras are on different recording servers.
-4. Improved video fetching logic - given 10sec polling interval, it ensures that video have at least skip+length seconds if still recording to avoid too short and truncated results.
+Sends the video of Synology Surveillance Station motion events to Telegram: the
+script polls recordings, cuts a short clip, re-encodes it and uploads it as an
+MP4 (or GIF).
 
-Supports multiple cameras polling and ffmpeg parameters
-Remembers already processed events across restarts.
+Features kept from the original project, plus a few fixes:
 
-## Config File
+1. Works with DSM 7+ / Surveillance Station 9+.
+2. Per-camera Telegram targets, including a different bot token per camera.
+3. Supports telegram proxy 
+4. CMS support: cameras on a recording server are downloaded through
+   `SYNO.SurveillanceStation.CMS` Redirect, as the API requires.
+5. The poller waits until a recording is long enough to cut, so a clip is never
+   truncated.
+6. Continuous dual-recording chunks are ignored (`dualRecModeList=0` plus a
+   `dual_rec_mode` check).
+7. Every new event is processed, not just the newest one, and events are
+   remembered across restarts in SQLite.
+8. Uploads are retried on network errors, 429 and 5xx; a failing event can
+   never loop forever.
 
-Needs a simple JSON based config file passed in on the command line.
+## Requirements
 
-For example:
+* Docker (recommended), or Python 3.11+ and ffmpeg in `PATH`.
+* `pip install -r requirements.txt`.
+
+## Running
+
+```bash
+docker run --rm \
+  -v "$PWD/config.json:/config/config.json:ro" \
+  -v "$PWD/data:/data" \
+  -v "$PWD/gifs:/gifs" \
+  syno/syno_telegram_gifs:local /config/config.json
+```
+
+Or without Docker:
+
+```bash
+python3 -m syno_telegram_gifs config.json
+```
+
+Flags for checks:
+
+* `--once` — poll every camera once and exit.
+* `--dry-run` — download and convert, but do not send anything and do not
+  advance the checkpoint. Meant to be combined with `--once`; repeated runs
+  process the same events again.
+* `--log-level DEBUG|INFO|WARNING|ERROR` — override `log_level`.
+
+Stop it with SIGINT/SIGTERM: workers finish the current event, temp files are
+removed and the database is closed.
+
+## Config file
+
+A JSON object; see `config-sample.json`.
 
 ```json
 {
-  "data_folder": "./data", // <-- Leave it empty if you are using docker image
+  "data_folder": "./data",
   "ffmpeg_working_folder": "./gifs",
-  "tele_bot_token": "XXX", // <-- default token for all cameras, can be empty if specified per camera
-  "tele_chat_id": 123, // <-- default chat id for all cameras, can be empty if specified per camera
-  "synology_base_api_url": "http://127.0.0.1",
+  "tele_bot_token": "XXX",
+  "tele_chat_id": 123,
+  "synology_base_api_url": "https://192.168.1.2:5001",
   "synology_user": "admin",
   "synology_password": "password123",
   "synology_cameras": [
     {
-      "id": 1, 
-      "skip_first_n_secs": 5, //<-- Skip seconds recorded before motion event is triggered
-      "max_length_secs": 5, //<-- Do not create gif for video full length but only with first n seconds
-      "video_max_height": 480, //<-- Output video height in lines (e.g. 480 = 480p); smaller sources are never upscaled
-      "tele_bot_token": "XXX", //<-- custom bot token for this camera
-      "tele_chat_id": 123 //<-- custom chat id for this camera
-    },
-    {
-      "id": 2,
-      "skip_first_n_secs": 7,
-      "max_length_secs": 10,
+      "id": 1,
+      "skip_first_n_secs": 5,
+      "max_length_secs": 5,
       "video_max_height": 480,
-      "topic_name": "camera_2"
+      "fps": 15
     }
   ]
 }
-
-```
-* `data_folder`: Path where to stored sqlite db for already processed events (preserve state across restarts). Leave empty if using docker image.
-* `tele_bot_token`: Telegram Bot token, this is a default global setting, can be skipped when using per-camera setting
-* `tele_chat_id`: Target chat id, this is a default global setting, can be skipped when using per-camera setting
-* `video_preset`: Global x264 encoding preset for mp4 delivery (default "veryfast")
-* `tele_read_timeout`: Read timeout in seconds for Telegram HTTP requests (default 60)
-* `tele_connect_timeout`: Connect timeout in seconds for Telegram HTTP requests (default 20)
-* `tele_send_attempts`: Upload attempts per event, hard-limited to 3 (default 3); after the last failed attempt the event is marked as processed
-* `tele_retry_backoff_secs`: Base backoff between upload attempts in seconds (default 5, grows as 5/10/...)
-* `ffmpeg_working_folder`: Working folder for downloaded mp4 videos and created GIFs
-* `synology_base_api_url`: Base url of Synology Surveillance Station APIs
-* `synology_user`: User to access Synology Surveillance Station APIs
-* `synology_password`: User's password to access Synology Surveillance Station APIs
-* `synology_cameras`: Array of cameras for events polling
-    * `id`: Synology Surveillance Station camera id
-    * `skip_first_n_secs`: Skip seconds recorded before motion event is triggered
-    * `max_length_secs`: Do not create gif for video full length but only with first n seconds
-    * `video_max_height`: Output video height in lines (e.g. 480 = 480p); width follows aspect ratio, smaller sources are never upscaled
-    * `tele_bot_token`: Per-camera Telegram settings
-    * `tele_chat_id`: Per-camera Telgram settings
-
-If you don't know camera ids, leave cameras section empty and you'll get ids printed at first run
-```
-"synology_cameras": []
-```
-Example:
-```
-[INFO] (MainThread) Synology Info Camera Id 1 Name arzilla_veranda IP 192.168.1.87
-[INFO] (MainThread) Synology Info Camera Id 2 Name arzilla_piazzale IP 192.168.1.88
-[INFO] (MainThread) Synology Info Camera Id 3 Name arzilla_campo IP 192.168.1.148
-[INFO] (MainThread) Synology Info Camera Id 4 Name arzilla_veranda_interno IP 192.168.1.126
 ```
 
-## Installation
+### Global
 
-You need to build a docker image first if you want to run it in a container.
+| key | default | meaning |
+|---|---|---|
+| `data_folder` | `/data` | where `processed_events.db` lives |
+| `ffmpeg_working_folder` | `/gifs` | working folder for downloads and clips |
+| `format` | `mp4` | `mp4` or `gif` |
+| `video_preset` | `veryfast` | x264 preset for mp4 |
+| `tele_bot_token` | — | default token for all cameras |
+| `tele_chat_id` | — | default chat id for all cameras |
+| `proxy` | — | e.g. `socks5h://user:pass@host:port` |
+| `tele_base_url` | — | custom Telegram API endpoint |
+| `tele_connect_timeout` | 20 | Telegram connect timeout, seconds |
+| `tele_read_timeout` | 60 | Telegram read timeout, seconds |
+| `tele_send_attempts` | 3 | upload attempts per event, capped at 3 |
+| `tele_retry_backoff_secs` | 5 | base backoff between upload attempts |
+| `poll_interval_secs` | 10 | pause between polls of one camera |
+| `event_backlog_secs` | 0 | skip events older than this on start; 0 = no limit |
+| `syno_timeout_connect` | 10 | Surveillance Station connect timeout, seconds |
+| `syno_timeout_read` | 60 | Surveillance Station read timeout, seconds |
+| `syno_verify_ssl` | false | verify the NAS certificate; most NAS use a self-signed one, so `false` is the default |
+| `log_level` | INFO | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 
-If you'd prefer to install dependencies yourself, you'll need:
+### Per camera
 
-* ffmpeg 4.0 (other versions probably work, but that's what I tested with)
-* Python 3.9
-* python libraries listed in `requirements.txt` (install via `pip install -r requirements.txt`)
+| key | default | meaning |
+|---|---|---|
+| `id` | — | Surveillance Station camera id (required) |
+| `skip_first_n_secs` | 0 | seconds skipped at the start of the recording |
+| `max_length_secs` | — | clip length in seconds (required) |
+| `video_max_height` | 480 | output height in lines; width follows the aspect ratio |
+| `fps` | 15 | output frame rate |
+| `tele_bot_token` | global | token for this camera |
+| `tele_chat_id` | global | chat id for this camera |
+| `enabled` | true | set to `false` to keep the entry but stop polling |
+
+If you don't know the camera ids, set `"synology_cameras": []`: the ids are
+printed at startup and the process exits.
+
+## How it works
+
+For each configured camera a thread polls `Recording.List`, takes every event
+newer than the checkpoint, and processes them oldest first:
+
+```
+download partial slice -> ffmpeg -> Telegram -> checkpoint
+```
+
+* The slice is `skip_first_n_secs + max_length_secs + 4` seconds, downloaded
+  with `offsetTimeMs=0` / `playTimeMs`, so only the needed part is transferred.
+* Conversions take a shared lock: only one ffmpeg runs at a time, so adding
+  cameras does not multiply CPU load.
+* Download and conversion happen once; only the upload is retried.
+* An event is marked processed after a delivery attempt that succeeded or ran
+  out of retries, and after a broken event has failed 3 times.
+
+On the very first run the checkpoint is seeded with the newest event and
+nothing is sent, so an existing archive is not uploaded.
+
+The database is `processed_events`, one row per camera (`camera_id`,
+`last_event_id`). It is compatible with the database of the previous
+single-file version.
+
+## Development
+
+* `./build.sh` builds `syno/syno_telegram_gifs:local`.
+

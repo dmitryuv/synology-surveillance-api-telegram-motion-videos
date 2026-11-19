@@ -4,3 +4,10 @@ gifs
 config-test.json
 config.json
 data
+work
+__pycache__
+*.tar
+.DS_store
+.ruff_cache
+*.egg-info
+.venv

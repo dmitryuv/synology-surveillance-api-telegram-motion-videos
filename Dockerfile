@@ -1,21 +1,24 @@
-FROM jrottenberg/ffmpeg:4.1-alpine
+FROM python:3.13-slim
 
-RUN apk add --no-cache python3 && \
-    python3 -m ensurepip --upgrade && \
-    rm -r /usr/lib/python*/ensurepip && \
-    pip3 install --no-cache --upgrade pip setuptools
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LANG=C.UTF-8
 
-COPY requirements.txt /
-RUN CGO_ENABLED=0 \
-    GOOS=$TARGETOS \
-    GOARCH=$TARGETARCH \
-    pip3 install --no-cache-dir -r /requirements.txt
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 
-COPY syno_telegram_gifs.py /
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+ && rm /tmp/requirements.txt
 
-VOLUME /config /gifs /data
-ENV PATH=/usr/local/bin:$PATH
-ENV LANG=C.UTF-8
+COPY syno_telegram_gifs /syno_telegram_gifs
 
-ENTRYPOINT ["/usr/bin/env"]
-CMD ["python3", "/syno_telegram_gifs.py", "/config/config.json"]
+# relative data_folder/ffmpeg_working_folder from the config ("/data", "/gifs")
+# resolve inside the mounted volumes from here.
+WORKDIR /
+
+VOLUME ["/config", "/gifs", "/data"]
+
+ENTRYPOINT ["python3", "-m", "syno_telegram_gifs"]
+CMD ["/config/config.json"]

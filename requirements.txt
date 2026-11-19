@@ -1,3 +1,3 @@
-requests
-telebot
-pysocks
+pyTelegramBotAPI==4.37.1
+requests==2.34.2
+PySocks==1.7.1
